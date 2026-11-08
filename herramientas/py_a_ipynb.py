@@ -2,13 +2,28 @@
 
 Uso: python py_a_ipynb.py <entrada.py> <salida.ipynb>
 Las celdas '# MAGIC %md' pasan a celdas de texto; '# MAGIC %pip …' a celdas de código con el comando mágico.
+Soporta bloques de entorno Serverless PEP 723 ('# /// script ... # ///') exportados por Databricks.
 """
 import json
+import re
 import sys
 
 
+_RE_PEP723 = re.compile(r"\A(?:# /// script\n(?:#.*\n)*?# ///\n+)")
+
+
 def convertir(texto: str) -> dict:
+    texto = texto.replace("\r\n", "\n")
     texto = texto.replace("# Databricks notebook source\n", "", 1)
+    meta_extra = {}
+    m = _RE_PEP723.match(texto)
+    if m:
+        bloque_env = [
+            l[2:] if l.startswith("# ") else l[1:]
+            for l in m.group(0).strip().split("\n")[1:-1]
+        ]
+        meta_extra["databricks_environment"] = "\n".join(bloque_env)
+        texto = texto[m.end():]
     celdas = []
     for bloque in texto.split("\n# COMMAND ----------\n"):
         lineas = bloque.strip("\n").split("\n")
@@ -28,9 +43,12 @@ def convertir(texto: str) -> dict:
         c["id"] = f"celda-{i:03d}"            # nbformat 4.5 exige un identificador único por celda
         if c["source"]:
             c["source"][-1] = c["source"][-1].rstrip("\n")
-    return {"cells": celdas, "nbformat": 4, "nbformat_minor": 5,
-            "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-                         "language_info": {"name": "python"}}}
+    metadata = {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python"},
+    }
+    metadata.update(meta_extra)
+    return {"cells": celdas, "nbformat": 4, "nbformat_minor": 5, "metadata": metadata}
 
 
 if __name__ == "__main__":

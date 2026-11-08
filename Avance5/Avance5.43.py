@@ -13,7 +13,7 @@
 # MAGIC
 # MAGIC **Qué hace esta libreta.** Parte de los mejores modelos individuales del Avance 4, les ajusta hiperparámetros y
 # MAGIC construye ensambles homogéneos y heterogéneos; elige el modelo final con criterios de negocio **antes** de ver los
-# MAGIC datos de prueba y después lo evalúa una sola vez en septiembre (datos no vistos). Termina con intervalos de
+# MAGIC datos de prueba y después lo evalúa una sola vez en septiembre y octubre (datos no vistos). Termina con intervalos de
 # MAGIC pronóstico (P10/P50/P90), una compuerta de aceptación, el registro del modelo y la tabla de pronóstico operativo.
 # MAGIC
 # MAGIC | Clave | Modelo | Tipo | Estrategia |
@@ -43,7 +43,7 @@
 # MAGIC | --- | --- | --- | --- |
 # MAGIC | `ajuste` | 20-may | 21-may a 03-jun | Optuna, número de árboles y primeros pesos de los ensambles |
 # MAGIC | `corte_1` … `corte_4` | 03-jun, 17-jun, 01-jul, 17-ago | 4 bloques de 14 días | **desarrollo**: comparar y elegir (los mismos del Avance 4) |
-# MAGIC | `prueba_1`, `prueba_2` | 31-ago, 14-sep | 01–14 y 15–28 de septiembre | **datos no vistos**: el modelo elegido, congelado con datos al 31-ago, pronostica septiembre |
+# MAGIC | `prueba_1` … `prueba_4` | 31-ago, 14-sep, 28-sep, 12-oct | 1-sep a 26-oct en cuatro bloques | **datos no vistos**: el modelo elegido, congelado con datos al 31-ago, pronostica septiembre |
 # MAGIC | `pronostico` | último día con datos | 14 días siguientes | salida operativa (sin objetivo todavía) |
 # MAGIC
 # MAGIC **Dónde se cumple cada criterio de la rúbrica**
@@ -54,7 +54,7 @@
 # MAGIC | Tabla comparativa ordenada por la métrica principal, con otras métricas y tiempos de entrenamiento | §5.2 y §5.3 |
 # MAGIC | Elección del modelo final alineada con el negocio | §5.7 (matriz de decisión) y §6.5 (compuerta) |
 # MAGIC | Gráficos del modelo final con interpretación | §7 (siete gráficos, cada uno con su lectura calculada) |
-# MAGIC | Objetivo 3.6: evaluación en datos no vistos | §5.3, §6 y §7 (septiembre) |
+# MAGIC | Objetivo 3.6: evaluación en datos no vistos | §5.3, §6 y §7 (septiembre y octubre) |
 # MAGIC | Declaración sobre el uso de herramientas de IA | última celda |
 # MAGIC
 # MAGIC **Confidencialidad.** Con `MODO_PUBLICO = True` las salidas sólo muestran métricas relativas, tiempos,
@@ -82,23 +82,23 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install "lightgbm>=4.3"
+# MAGIC %pip install lightgbm
 
 # COMMAND ----------
 
-# MAGIC %pip install "xgboost>=2.0"
+# MAGIC %pip install xgboost
 
 # COMMAND ----------
 
-# MAGIC %pip install "catboost>=1.2"
+# MAGIC %pip install catboost
 
 # COMMAND ----------
 
-# MAGIC %pip install "optuna>=3.6"
+# MAGIC %pip install optuna
 
 # COMMAND ----------
 
-# MAGIC %pip install "shap>=0.44"
+# MAGIC %pip install shap
 
 # COMMAND ----------
 
@@ -115,16 +115,17 @@ except Exception:
 CATALOGO       = "modeladoprescriptivoventas"     # catálogo de Unity Catalog del proyecto
 ESQUEMA_DATOS  = "maestria"                       # esquema donde están los volúmenes de Bnext
 RAIZ_VOLUMENES = "/Volumes"
-MESES = ["2026-03", "2026-04", "2026-05", "2026-06", "2026-07", "2026-08", "2026-09"]   # un volumen por mes
+MESES = ["2026-03", "2026-04", "2026-05", "2026-06", "2026-07", "2026-08", "2026-09", "2026-10"]   # un volumen por mes
 
 # Cortes del walk-forward. Son FIJOS (los del Avance 4): así, al llegar un mes nuevo, los modelos se siguen comparando
 # en las mismas ventanas. Los bloques de prueba son datos no vistos: no intervienen en el ajuste ni en la elección del
-# modelo y sólo existen cuando ya están cargados sus días (septiembre).
+# modelo y sólo existen cuando ya están cargados sus días (septiembre y octubre).
 DIAS_CORTE = 14                                           # días que se pronostican desde cada origen
 ORIGEN_AJUSTE = "2026-05-20"                              # bloque 21-may…03-jun: sólo para afinar hiperparámetros
 ORIGENES_CORTES = {"corte_1": "2026-06-03", "corte_2": "2026-06-17",      # desarrollo: con estos se compara y se elige
                    "corte_3": "2026-07-01", "corte_4": "2026-08-17"}
-ORIGENES_PRUEBA = {"prueba_1": "2026-08-31", "prueba_2": "2026-09-14"}    # prueba no vista: 01–14 y 15–28 de septiembre
+ORIGENES_PRUEBA = {"prueba_1": "2026-08-31", "prueba_2": "2026-09-14",    # prueba no vista: 01–14 y 15–28 de septiembre
+                   "prueba_3": "2026-09-28", "prueba_4": "2026-10-12"}    # y 29-sep–12-oct, 13–26 de octubre (modelos congelados al 31-ago)
 
 # Dónde se guardan las tablas del equipo:
 #   False → dentro de maestria con prefijo de capa: modeladoprescriptivoventas.maestria.bronze_ventas_lineas,
@@ -138,6 +139,55 @@ COLUMNA_FECHA_VENTA = "finish_order"
 HORAS_EN_UTC = False
 
 VOLUMENES = f"{RAIZ_VOLUMENES}/{CATALOGO}/{ESQUEMA_DATOS}"      # /Volumes/modeladoprescriptivoventas/maestria
+
+
+def _parametro_a_texto(valor):
+    if valor is None:
+        return ""
+    if isinstance(valor, bool):
+        return "True" if valor else "False"
+    if isinstance(valor, (list, tuple)):
+        return ",".join(str(v) for v in valor)
+    return str(valor)
+
+
+def _parametro_desde_texto(texto, defecto):
+    """Convierte el texto del widget al tipo del valor por defecto. Vacío = valor por defecto (o None si el defecto es None)."""
+    texto = (texto or "").strip()
+    if texto == "" or texto.lower() in ("none", "null"):
+        return defecto if defecto is not None else None
+    if isinstance(defecto, bool):
+        if texto.lower() in ("true", "1", "sí", "si", "yes", "verdadero"):
+            return True
+        if texto.lower() in ("false", "0", "no", "falso"):
+            return False
+        raise ValueError(f"El parámetro esperaba True/False y recibió {texto!r}")
+    if isinstance(defecto, int) and not isinstance(defecto, bool):
+        return int(float(texto))
+    if isinstance(defecto, float):
+        return float(texto)
+    if isinstance(defecto, (list, tuple)):
+        if texto.startswith("["):
+            import json
+            return list(json.loads(texto))
+        return [v.strip() for v in texto.split(",") if v.strip()]
+    return texto
+
+
+def parametro(nombre, defecto, descripcion=None):
+    """Parámetro del notebook con el mismo nombre que la variable. Si el notebook corre en un Job (o se escribió el valor
+    en el widget de la parte superior), toma ese valor; si no, usa el valor por defecto escrito en el código. El tipo
+    (True/False, número, lista separada por comas, texto) se deduce del valor por defecto. Así el mismo notebook sirve en
+    interactivo y en Workflows sin editar celdas."""
+    try:
+        dbutils.widgets.text(nombre, _parametro_a_texto(defecto), descripcion or nombre)
+        crudo = dbutils.widgets.get(nombre)
+    except Exception:
+        return defecto
+    valor = _parametro_desde_texto(crudo, defecto)
+    if _parametro_a_texto(valor) != _parametro_a_texto(defecto):
+        print(f"(parámetro {nombre} = {valor!r}, tomado del widget o del Job; por defecto {defecto!r})")
+    return valor
 
 if ESQUEMAS_PROPIOS:      # si los esquemas propios no existen, se usa maestria (así nunca falla por esquema inexistente)
     try:
@@ -347,6 +397,49 @@ def guardar(df, capa, nombre, comentario=None, modo="overwrite", particion=None)
     return nombre_tabla
 
 
+def comentar_columnas(nombre_tabla, descripciones):
+    """Escribe el comentario de cada columna de una tabla (queda visible en Catalog Explorer y lo usa Genie)."""
+    hechos = 0
+    for col, texto in (descripciones or {}).items():
+        try:
+            spark.sql(f"ALTER TABLE {nombre_tabla} ALTER COLUMN `{col}` COMMENT '{str(texto).replace(chr(39), '')}'")
+            hechos += 1
+        except Exception:
+            pass
+    return hechos
+
+
+def asegurar_restricciones(nombre_tabla, restricciones):
+    """Agrega restricciones CHECK de Delta que aún no existan. restricciones = {"nombre": "expresión SQL"}. Delta valida
+    la regla sobre los datos existentes: si no se cumple, la rechaza y aquí queda como aviso (la tabla sigue sin ella)."""
+    try:
+        existentes = {r["key"].replace("delta.constraints.", "") for r in spark.sql(f"SHOW TBLPROPERTIES {nombre_tabla}").collect()
+                      if str(r["key"]).startswith("delta.constraints.")}
+    except Exception:
+        existentes = set()
+    for nombre, expresion in (restricciones or {}).items():
+        if nombre in existentes:
+            continue
+        try:
+            spark.sql(f"ALTER TABLE {nombre_tabla} ADD CONSTRAINT {nombre} CHECK ({expresion})")
+        except Exception as e:
+            aviso(f"la restricción {nombre} ({expresion}) no se pudo agregar a {nombre_tabla}: {str(e)[:140]}")
+
+
+def borrar_corrida(nombre_tabla, valor, columna="run_id"):
+    """Borra de una tabla las filas de una corrida antes de volver a escribirlas (idempotencia: repetir o reanudar una
+    corrida no duplica resultados). Devuelve True si borró o no había nada que borrar."""
+    if not existe(nombre_tabla):
+        return True
+    try:
+        if columna in spark.table(nombre_tabla).columns:
+            spark.sql(f"DELETE FROM {nombre_tabla} WHERE {columna} = '{str(valor).replace(chr(39), '')}'")
+        return True
+    except Exception as e:
+        print(f"(no se pudo borrar {columna} = {valor} de {nombre_tabla}: {type(e).__name__}: {str(e)[:100]})")
+        return False
+
+
 def tipos_de(df):
     """{columna: tipo de Spark} de un DataFrame."""
     return {f.name: f.dataType.simpleString() for f in df.schema.fields}
@@ -441,8 +534,29 @@ def cerrar(notebook, siguiente=None):
             print(f"\n(hallazgos guardados en {tabla('mlops', 'hallazgos')})")
     except Exception as e:
         print(f"\n(no se pudieron guardar los hallazgos: {type(e).__name__}: {str(e)[:120]})")
+    try:      # bitácora de corridas: qué notebook corrió, cuándo y cuánto tardó (la lee el tablero de estado del pipeline)
+        fila = [(notebook, dt.datetime.fromtimestamp(_INICIO_NOTEBOOK), dt.datetime.now(),
+                 float((time.time() - _INICIO_NOTEBOOK) / 60), len(HALLAZGOS),
+                 sum(1 for h in HALLAZGOS if h.startswith("REVISAR:")), "OK")]
+        (spark.createDataFrame(fila, "notebook string, inicio timestamp, fin timestamp, minutos double, hallazgos int, avisos int, estado string")
+         .write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(tabla("mlops", "corridas")))
+    except Exception as e:
+        print(f"(no se pudo registrar la corrida en mlops.corridas: {type(e).__name__})")
     if siguiente:
         print(f"\nSiguiente notebook: {siguiente}")
+
+
+class Cronometro:
+    """Mide los segundos de un bloque de código: `with Cronometro() as reloj: ...` y después `reloj.segundos`."""
+
+    def __enter__(self):
+        self._inicio = time.perf_counter()
+        self.segundos = 0.0
+        return self
+
+    def __exit__(self, *exc):
+        self.segundos = time.perf_counter() - self._inicio
+        return False
 
 
 def resumir_fechas(fechas, max_items=6):
@@ -578,33 +692,36 @@ print(f"Apoyo listo · Python {sys.version.split()[0]} · pandas {pd.__version__
 # ==================================================================================================================
 # 1.1 MODO DE EJECUCIÓN
 # ==================================================================================================================
-MODO_RAPIDO = True
+MODO_RAPIDO = parametro("MODO_RAPIDO", True)
 # True  → prueba de humo: ~5 % de las series en la evaluación, pocas pruebas de Optuna y menos árboles (20–40 min).
 #         Sirve para comprobar que todo corre de principio a fin. Sus cifras NO van al reporte.
 # False → corrida completa con todas las series evaluables (3.5–5 h con 16 GB). Conviene lanzarla como Job.
 
-MODO_PUBLICO = True
+MODO_PUBLICO = parametro("MODO_PUBLICO", True)
 # True  → lo que se imprime sólo contiene métricas relativas, tiempos, hiperparámetros y ventas indexadas (media = 100):
 #         la libreta ejecutada puede subirse a GitHub sin exponer información de Bnext. Las tablas Delta internas sí
 #         guardan las sumas completas, porque no salen de Databricks.
 
-EJECUTAR_ENTRENAMIENTO = True
+EJECUTAR_ENTRENAMIENTO = parametro("EJECUTAR_ENTRENAMIENTO", True)
 # False → se salta el entrenamiento (sección 4) y las secciones 5–10 muestran una corrida ya guardada.
 
-RUN_ID_REANUDAR = None
+RUN_ID_REANUDAR = parametro("RUN_ID_REANUDAR", None)
 # Identificador de una corrida interrumpida, p. ej. "av5_43_20261031t031500_1a2b3c4d" (se imprime al iniciar cada
 # corrida y queda en mlops.av5_ejecuciones). Con él, la libreta carga su punto de control y continúa en el siguiente
 # bloque sin repetir lo ya calculado.
 
-RUN_ID_A_MOSTRAR = None
+RUN_ID_A_MOSTRAR = parametro("RUN_ID_A_MOSTRAR", None)
 # Corrida que muestran las secciones 5–10. None = la de esta sesión o, si no hay, la última terminada.
 
 SEMILLA = 43
 # Semilla de todo lo aleatorio (muestreos, modelos, Optuna): misma semilla y mismos datos = mismo resultado.
 
-REENTRENAR_FINAL = True
+REENTRENAR_FINAL = parametro("REENTRENAR_FINAL", True)
 # True → al terminar, el modelo elegido se reentrena con todos los datos disponibles (hasta el último día con objetivo)
 #        para producir el pronóstico operativo y registrarse en Unity Catalog.
+
+# Todos los interruptores de esta sección se pueden fijar desde un Job (parámetros con el mismo nombre) o desde los
+# widgets de la parte superior del notebook; si no se tocan, valen lo que dice el código.
 
 # ==================================================================================================================
 # 1.2 RECURSOS DE CÓMPUTO
@@ -674,6 +791,7 @@ METADATOS = [
 ]
 COLUMNAS_CARGA = list(dict.fromkeys([*METADATOS, *NUMERICAS, *CATEGORICAS]))
 
+# ─────────────────────── diccionario de variables de la tabla Oro (lo comparten 20_features_oro y Avance5.43) ───────────────────────
 DESCRIPCION_VARIABLES = {
     # ---- historia de la serie (tienda × categoría); siempre con días ≤ T
     "s_t0": "Venta de la serie el día del origen T.",
@@ -741,6 +859,10 @@ DESCRIPCION_VARIABLES = {
     "estatus_tienda": "Estatus de la tienda en el catálogo.",
     "tipo_categoria": "Tipo de categoría: mercancía, servicio o genérico.",
     "categoria_id": "Categoría (identificador canónico homologado).",
+    # ---- promociones planeadas (calendario; sólo las publicadas antes del origen T)
+    "f_promos_planeadas": "Promociones planeadas que cubren el día objetivo y ya estaban publicadas en el origen T (0 si ninguna).",
+    "f_descuento_planeado": "Mayor descuento planeado (0–1) entre esas promociones; 0 si no hay promoción planeada.",
+    "f_dias_promo_restantes": "Días que le quedan a la promoción vigente en el día objetivo (0 si no hay promoción).",
 }
 DESCRIPCION_METADATOS = {
     "tienda": "Identificador de la tienda (nunca se imprime).",
@@ -899,11 +1021,12 @@ QUANTILE_COLUMNS = ("p10", "p50", "p90")
 NOMINAL_COVERAGE = 0.8                        # el intervalo P10–P90 debe cubrir el 80 % de los días reales
 BANDA_COBERTURA = (0.75, 0.85)                # banda de aceptación de la cobertura observada
 METODOS_INTERVALO = ("Q_Conformal", "Q_LightGBM_CQR")
-INCLUIR_Q_LIGHTGBM = True
+INCLUIR_Q_LIGHTGBM = parametro("INCLUIR_Q_LIGHTGBM", True)
 # Q_Conformal: intervalos alrededor del pronóstico del modelo elegido (residuos de un bloque reciente, por grupos).
 # Q_LightGBM_CQR: tres LightGBM cuantílicos con calibración conformal (el método del avance anterior), como comparación.
+# False ahorra ~40 min en modo completo: el modelo final usa entonces Q_Conformal.
 METODO_INTERVALOS = "automatico"
-# "automatico" → el modelo final usa el método con menor pérdida pinball en septiembre entre los que cumplen la banda.
+# "automatico" → el modelo final usa el método con menor pérdida pinball en los bloques de prueba entre los que cumplen la banda.
 N_TRAMOS_CONFORMAL = 10                       # tramos del pronóstico (deciles) en que se agrupan los residuos
 MIN_FILAS_GRUPO_CONFORMAL = 200               # un grupo con menos filas usa el grupo más amplio
 S6_QUANTILE_PARAMETERS = {
@@ -940,19 +1063,23 @@ TABLA_MONITOREO = tabla("mlops", "monitoreo_modelo")       # error, sesgo y cobe
 RUTA_PUNTOS_CONTROL = volumen("outputs", "avance5_puntos_control")   # carpeta de los puntos de control
 EXPERIMENTO_MLFLOW = None                 # None → /Users/<usuario>/mna_equipo43_avance5
 NOMBRE_MODELO_UC = f"{CATALOGO}.{ESQUEMA_DATOS}.demanda_categoria"
-REGISTRAR_EN_UC = None
+REGISTRAR_EN_UC = parametro("REGISTRAR_EN_UC", None)
+if isinstance(REGISTRAR_EN_UC, str):
+    REGISTRAR_EN_UC = REGISTRAR_EN_UC.strip().lower() in ("true", "1", "si", "sí")
 # None → se registra (alias @challenger) sólo en modo completo y si pasan las comprobaciones técnicas de la compuerta.
+# Como parámetro de Job: True / False / vacío (= None).
 NIVEL_TECHO_OPERATIVO = "p90"
 # Columna que se publica como techo operativo de surtido (P90 por defecto; cambiar cuando Bnext elija P80 o P90).
 
 # ==================================================================================================================
 # 1.7 CALENDARIO DE PROMOCIONES FUTURAS (apartado preparado; ver sección 9)
 # ==================================================================================================================
-USAR_CALENDARIO_PROMOS = False
-# Hoy el modelo sólo ve promociones PASADAS (variables s_* con días ≤ T). Cuando Bnext entregue el calendario de
-# promociones planeadas, se carga en la tabla de abajo y se cambia a True: las variables f_* entran al modelo.
-TABLA_CALENDARIO_PROMOS = tabla("silver", "calendario_promociones")
-VARIABLES_PROMO_FUTURA = ["f_promos_planeadas", "f_descuento_planeado", "f_dias_promo_restantes"]
+USAR_CALENDARIO_PROMOS = parametro("USAR_CALENDARIO_PROMOS", True)
+# True → entran al modelo las variables f_* del calendario de promociones planeadas (tabla que escribe
+#        13_calendario_promociones_plan a partir del Excel editable del volumen). Si la tabla no existe, se avisa y el
+#        modelo sigue sólo con promociones pasadas (variables s_* con días ≤ T). Sin fuga: en cada origen T sólo cuentan
+#        las promociones publicadas en o antes de T.
+# False → se ignora el calendario (comparable con la corrida sin promociones futuras).
 print("Configuración lista.")
 
 # COMMAND ----------
@@ -1123,7 +1250,10 @@ class FuenteAvance5:
         self.promos_vigentes_causal = (self.propiedades.get("mna.s_promos_vigentes_t0") == "causal_7d"
                                        and VARIABLE_CONDICIONAL in self._gold.columns)
         self.num_features = NUMERICAS + ([VARIABLE_CONDICIONAL] if self.promos_vigentes_causal else [])
-        self._promos_futuras = cargar_variables_promo_futura(spark) if USAR_CALENDARIO_PROMOS else None
+        self._promos_futuras, self.info_calendario = (cargar_variables_promo_futura(spark) if USAR_CALENDARIO_PROMOS
+                                                      else (None, {"activo": False, "motivo": "USAR_CALENDARIO_PROMOS = False"}))
+        if USAR_CALENDARIO_PROMOS and self._promos_futuras is None:
+            aviso(f"Calendario de promociones planeadas no disponible ({self.info_calendario.get('motivo')}): el modelo sigue sólo con promociones pasadas.")
         if self._promos_futuras is not None:
             self.num_features = self.num_features + VARIABLES_PROMO_FUTURA
         self.cat_features = CATEGORICAS.copy()
@@ -1139,7 +1269,7 @@ class FuenteAvance5:
             "numero_features": len(self.features_table),
             "s_promos_vigentes_t0": ("incluida: la Oro la declara causal (≤ T)" if self.promos_vigentes_causal else
                                      "excluida: la Oro no declara que sea causal"),
-            "calendario_promos_futuras": "activo" if self._promos_futuras is not None else "apagado",
+            "calendario_promos_futuras": self.info_calendario,
             "alcance_servicios": ALCANCE_SERVICIOS,
             "cortes": self.cortes, "pruebas": self.pruebas, "ajuste_origen": self.ajuste_origen,
             "oof_origenes": self.oof_origenes, "origen_pronostico": self.origen_pronostico,
@@ -1223,14 +1353,11 @@ class FuenteAvance5:
         return salida
 
     def _base(self):
-        """Snapshot con las variables de promociones futuras unidas (sólo si el calendario está activo)."""
+        """Snapshot con las variables de promociones planeadas unidas (sólo si el calendario está activo). En cada fila
+        cuentan únicamente las promociones publicadas en o antes de su origen T (unir_promociones_planeadas)."""
         if self._promos_futuras is None:
             return self._gold
-        unido = (self._gold.withColumn("_t", F.col("tienda").cast("string")).withColumn("_c", F.col("categoria_id").cast("string"))
-                 .join(self._promos_futuras, ["_t", "_c", "fecha_objetivo"], "left").drop("_t", "_c"))
-        for c in VARIABLES_PROMO_FUTURA:
-            unido = unido.withColumn(c, F.coalesce(F.col(c), F.lit(0.0)))
-        return unido
+        return unir_promociones_planeadas(self._gold, self._promos_futuras)
 
     def _resolver_metadata(self):
         resumen = (self._gold.where(self._elegible()).groupBy("conjunto", "corte", "origen")
@@ -1367,26 +1494,36 @@ class FuenteAvance5:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 2.2 Calendario de promociones futuras (funciones; se explica y activa en la sección 9)
-# MAGIC Hoy las variables de promoción del modelo (`s_tasa_descuento_28`, `s_intensidad_promo_28`, `s_promos_en_venta_28`,
-# MAGIC `s_promos_vigentes_t0`) describen **promociones pasadas** (días ≤ T). El modelo no sabe si en los próximos 14 días
-# MAGIC habrá una promoción, y por eso subestima los picos que éstas generan. Estas funciones convierten un calendario de
-# MAGIC promociones **planeadas** en tres variables por tienda × categoría × día objetivo:
-# MAGIC `f_promos_planeadas` (cuántas promociones estarán vigentes), `f_descuento_planeado` (el mayor descuento planeado) y
-# MAGIC `f_dias_promo_restantes` (días que le quedan a la promoción vigente). Son legítimas porque un plan se conoce en T.
+# MAGIC ### 2.2 Calendario de promociones planeadas (contrato compartido; se explica en la sección 9)
+# MAGIC Las variables de promoción `s_*` del modelo describen **promociones pasadas** (días ≤ T). Las variables `f_*`
+# MAGIC traen el **plan**: `f_promos_planeadas` (promociones que cubren el día objetivo), `f_descuento_planeado` (el mayor
+# MAGIC descuento planeado) y `f_dias_promo_restantes` (días que le quedan a la promoción). Salen de la tabla
+# MAGIC `silver.calendario_promociones_plan_dia` que escribe `13_calendario_promociones_plan` a partir del Excel editable
+# MAGIC del volumen. Para que no haya fuga, en cada origen T sólo cuentan las promociones cuya `fecha_publicacion` es ≤ T:
+# MAGIC es exactamente lo que el negocio sabía al pronosticar. Estas funciones son las mismas en 13, 20, 22 y 30.
 
 # COMMAND ----------
 
+# ─────────────────────── calendario de promociones planeadas (contrato compartido por 13, 20, Avance5.43, 22 y 30) ───────────────────────
+TABLA_CALENDARIO_PLAN = tabla("silver", "calendario_promociones_plan")          # una fila por promoción × alcance (lo que se edita)
+TABLA_CALENDARIO_PLAN_DIA = tabla("silver", "calendario_promociones_plan_dia")  # tienda × categoría × día con las promociones que lo cubren
+VARIABLES_PROMO_FUTURA = ["f_promos_planeadas", "f_descuento_planeado", "f_dias_promo_restantes"]
 ESQUEMA_CALENDARIO_PROMOS = {
-    "promo_id": "texto · identificador de la promoción",
-    "inicio_planeado": "fecha · primer día planeado",
-    "fin_planeado": "fecha · último día planeado",
-    "categoria_id": "texto · categoría (mismo identificador canónico de la Oro)",
+    "promo_id": "texto · identificador de la promoción (obligatorio)",
+    "nombre": "texto · nombre comercial (opcional)",
+    "inicio_planeado": "fecha · primer día planeado (obligatorio)",
+    "fin_planeado": "fecha · último día planeado (obligatorio)",
+    "categoria_id": "texto · categoría canónica; vacío si se da categoria_nombre; TODAS = todas las categorías (o las del tipo_categoria indicado)",
+    "categoria_nombre": "texto · nombre de la categoría tal como está en silver.catalogo_categorias (se traduce a categoria_id); TODAS = todas",
+    "tipo_categoria": "texto · mercancia / generico / servicio; con TODAS acota a ese tipo (vacío = todos los tipos)",
     "tienda": "texto · tienda; vacío = todas las tiendas del alcance indicado en zona o región",
     "zona": "texto · zona; vacío = no se acota por zona",
     "region": "texto · región; vacío = no se acota por región",
-    "descuento_planeado": "decimal 0–1 · descuento planeado (opcional)",
-    "tipo_mecanica": "texto · 'precio', 'lleva N paga M', 'regalo', … (opcional)",
+    "descuento_planeado": "decimal 0–1 · descuento planeado (0.15 = 15 %); vacío = desconocido (se imputa el descuento histórico de la categoría)",
+    "tipo_mecanica": "texto · 'descuento', 'lleva N paga M', 'precio fijo', 'regalo', … (opcional)",
+    "fecha_publicacion": "fecha · desde cuándo se conoce el plan; vacío = inicio_planeado − DIAS_ANTICIPACION_DEFECTO",
+    "fuente": "texto · 'bnext' (plan real), 'placeholder' (inventada, sustituir) o 'historico_observado' (derivada del 09)",
+    "comentario": "texto · libre (opcional)",
 }
 
 
@@ -1404,33 +1541,38 @@ def validar_calendario_promociones(calendario) -> dict:
 
 
 def cargar_variables_promo_futura(spark):
-    """Construye (tienda, categoria_id, fecha_objetivo) → variables f_* a partir de TABLA_CALENDARIO_PROMOS. Si la tabla
-    no existe o no es válida, avisa y regresa None (el modelo sigue sin promociones futuras)."""
-    if not existe(TABLA_CALENDARIO_PROMOS):
-        aviso(f"USAR_CALENDARIO_PROMOS = True pero no existe {TABLA_CALENDARIO_PROMOS}: el modelo sigue sin promociones futuras.")
-        return None
-    cal = spark.table(TABLA_CALENDARIO_PROMOS)
-    revision = validar_calendario_promociones(cal)
-    if not revision["valido"]:
-        aviso(f"El calendario de promociones no es válido ({revision}); no se usa.")
-        return None
-    for c in ("tienda", "zona", "region", "descuento_planeado"):
-        if c not in cal.columns:
-            cal = cal.withColumn(c, F.lit(None).cast("string" if c != "descuento_planeado" else "double"))
-    tiendas = spark.table(tabla("silver", "catalogo_tiendas")).select(
-        F.col("tienda").cast("string").alias("_t"), F.col("zona").cast("string").alias("_zona"),
-        F.col("region").cast("string").alias("_region"))
-    alcance = (cal.crossJoin(F.broadcast(tiendas))
-               .where((F.col("tienda").isNull() | (F.col("tienda").cast("string") == F.col("_t")))
-                      & (F.col("zona").isNull() | (F.col("zona").cast("string") == F.col("_zona")))
-                      & (F.col("region").isNull() | (F.col("region").cast("string") == F.col("_region")))))
-    dias = (alcance.withColumn("fecha_objetivo", F.explode(F.sequence(F.col("inicio_planeado").cast("date"),
-                                                                       F.col("fin_planeado").cast("date"))))
-            .withColumn("_restantes", F.datediff(F.col("fin_planeado").cast("date"), F.col("fecha_objetivo"))))
-    return (dias.groupBy("_t", F.col("categoria_id").cast("string").alias("_c"), "fecha_objetivo")
-            .agg(F.countDistinct("promo_id").cast("float").alias("f_promos_planeadas"),
-                 F.coalesce(F.max("descuento_planeado"), F.lit(0.0)).cast("float").alias("f_descuento_planeado"),
-                 F.min("_restantes").cast("float").alias("f_dias_promo_restantes")))
+    """Tabla tienda × categoría × día con las promociones planeadas que lo cubren (la escribe 13_calendario_promociones_plan).
+    Regresa (DataFrame listo para unir, información) o (None, motivo) si no existe o no es válida."""
+    if not existe(TABLA_CALENDARIO_PLAN_DIA):
+        return None, {"activo": False, "motivo": f"no existe {TABLA_CALENDARIO_PLAN_DIA}: corre 13_calendario_promociones_plan"}
+    dia = spark.table(TABLA_CALENDARIO_PLAN_DIA)
+    faltan = {"tienda", "categoria_id", "fecha", "promos"} - set(dia.columns)
+    if faltan:
+        return None, {"activo": False, "motivo": f"{TABLA_CALENDARIO_PLAN_DIA} no tiene las columnas {sorted(faltan)}"}
+    resumen = dia.agg(F.count("*").alias("filas"), F.min("fecha").alias("primer_dia"), F.max("fecha").alias("ultimo_dia"),
+                      F.max("version_plan").alias("version_plan")).collect()[0].asDict()
+    if not resumen["filas"]:
+        return None, {"activo": False, "motivo": f"{TABLA_CALENDARIO_PLAN_DIA} está vacía"}
+    listo = dia.select(F.col("tienda").cast("string").alias("_t"), F.col("categoria_id").cast("string").alias("_c"),
+                       F.col("fecha").alias("fecha_objetivo"), F.col("promos"))
+    return listo, {"activo": True, **{k: (str(v) if k != "filas" else int(v)) for k, v in resumen.items()}}
+
+
+def unir_promociones_planeadas(df, dia):
+    """Agrega a un DataFrame de la Oro (tienda, categoria_id, origen, fecha_objetivo) las variables f_*: sólo cuentan las
+    promociones cuya fecha_publicacion es ≤ origen (lo que se sabía al pronosticar), por eso no hay fuga en los cortes."""
+    if dia is None:
+        for c in VARIABLES_PROMO_FUTURA:
+            df = df.withColumn(c, F.lit(0.0).cast("float"))
+        return df
+    unido = (df.withColumn("_t", F.col("tienda").cast("string")).withColumn("_c", F.col("categoria_id").cast("string"))
+             .join(dia, ["_t", "_c", "fecha_objetivo"], "left").drop("_t", "_c")
+             .withColumn("_vis", F.expr("filter(promos, p -> p.fecha_publicacion <= origen)")))
+    sin = F.col("promos").isNull()
+    return (unido.withColumn("f_promos_planeadas", F.when(sin, F.lit(0)).otherwise(F.size("_vis")).cast("float"))
+            .withColumn("f_descuento_planeado", F.coalesce(F.when(sin, F.lit(0.0)).otherwise(F.expr("array_max(transform(_vis, p -> p.descuento))")), F.lit(0.0)).cast("float"))
+            .withColumn("f_dias_promo_restantes", F.coalesce(F.when(sin, F.lit(0)).otherwise(F.expr("array_min(transform(_vis, p -> p.restantes))")), F.lit(0)).cast("float"))
+            .drop("promos", "_vis"))
 
 # COMMAND ----------
 
@@ -2968,7 +3110,8 @@ class RegistroFormal:
             return pickle.load(f)
 
     def publicar_tablas(self, tables: Mapping) -> dict:
-        """Agrega cada tabla a mlops.av5_<nombre> con run_id y fecha. Rechaza tablas con identificadores de tienda."""
+        """Agrega cada tabla a mlops.av5_<nombre> con run_id y fecha. Es idempotente: si la corrida ya había publicado
+        (p. ej. se reanudó), primero borra sus filas. Rechaza tablas con identificadores de tienda."""
         publicadas = {}
         for name, frame in tables.items():
             if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -2985,6 +3128,7 @@ class RegistroFormal:
             datos.insert(0, "run_id", self.run_id)
             datos["fecha_publicacion"] = pd.Timestamp.now()
             limpio, esquema = _para_spark(datos)
+            borrar_corrida(destino, self.run_id)
             (self.spark.createDataFrame(limpio, schema=esquema).write.format("delta").mode("append")
              .option("mergeSchema", "true").saveAsTable(destino))
             publicadas[name] = destino
@@ -3105,12 +3249,12 @@ def registrar_modelo_uc(registro, candidate, ejemplo, metricas) -> dict:
 # MAGIC    bolsa (bloques anteriores); predicción del universo evaluable por lotes de horizonte; sumas en los acumuladores;
 # MAGIC    las filas de la muestra común de este corte entran a la bolsa para los cortes siguientes.
 # MAGIC 4. **Selección.** Matriz de decisión con los cortes de desarrollo. El modelo elegido se registra **antes** de ver
-# MAGIC    septiembre.
-# MAGIC 5. **Prueba (datos no vistos).** Todo se entrena con datos al 31-ago y se congela; pronostica los dos bloques de
-# MAGIC    septiembre sin reentrenar. Se evalúan también los intervalos (conformal calibrado con el bloque del 18 al 31 de
-# MAGIC    agosto y LightGBM cuantílico).
-# MAGIC 6. **Modelo final.** El elegido se reentrena con todos los datos, se recalibran sus intervalos con septiembre, se
-# MAGIC    calcula la importancia de variables y se pronostican los 14 días siguientes al último dato.
+# MAGIC    los bloques de prueba.
+# MAGIC 5. **Prueba (datos no vistos).** Todo se entrena con datos al 31-ago y se congela; pronostica los bloques de prueba
+# MAGIC    (septiembre y octubre, hasta 8 semanas sin reentrenar: también mide cuánto envejece el modelo). Se evalúan los
+# MAGIC    intervalos (conformal calibrado con el bloque del 18 al 31 de agosto y LightGBM cuantílico).
+# MAGIC 6. **Modelo final.** El elegido se reentrena con todos los datos, se recalibran sus intervalos con el último bloque
+# MAGIC    observado, se calcula la importancia de variables y se pronostican los 14 días siguientes al último dato.
 
 # COMMAND ----------
 
@@ -3340,7 +3484,7 @@ def ejecutar_modelado(fuente, registro, n_jobs=None, estado=None) -> dict:
         gc.collect()
         cerrar_paso(bloque["corte"], {"minutos": reloj_corte.segundos / 60})
 
-    # ---------------------------------------------------------------- 4. selección (antes de ver septiembre)
+    # ---------------------------------------------------------------- 4. selección (antes de ver los bloques de prueba)
     if "seleccion" not in completados:
         subtitulo("4. Selección del modelo final con los cortes de desarrollo")
         tablas_dev = acum_dev["ampliada"].tablas()
@@ -3391,7 +3535,7 @@ def ejecutar_modelado(fuente, registro, n_jobs=None, estado=None) -> dict:
         gc.collect()
         cerrar_paso("prueba")
     elif not fuente.pruebas:
-        aviso("La Oro no tiene bloques de prueba: no hay evaluación en datos no vistos (carga septiembre y reconstruye 02 → 20).")
+        aviso("La Oro no tiene bloques de prueba: no hay evaluación en datos no vistos (carga los meses de prueba y reconstruye 02 → 20).")
 
     # ---------------------------------------------------------------- 6. modelo final, intervalos, importancia y pronóstico
     if REENTRENAR_FINAL and "final" not in completados:
@@ -3792,6 +3936,7 @@ if EJECUTAR_ENTRENAMIENTO:
             MONITOREO_AV5 = monitoreo_desde_prueba(acum_p, MODELO_FINAL, COMPUERTA_AV5["metodo_intervalos"], wm_dev) if acum_p._sumas else pd.DataFrame()
             if len(MONITOREO_AV5) and not MODO_RAPIDO:
                 limpio, esquema = _para_spark(MONITOREO_AV5.assign(run_id=REGISTRO_AV5.run_id, fecha_calculo=pd.Timestamp.now()))
+                borrar_corrida(TABLA_MONITOREO, REGISTRO_AV5.run_id)
                 (spark.createDataFrame(limpio, schema=esquema).write.format("delta").mode("append")
                  .option("mergeSchema", "true").saveAsTable(TABLA_MONITOREO))
             # ---- registro en Unity Catalog
@@ -3800,11 +3945,14 @@ if EJECUTAR_ENTRENAMIENTO:
             candidato = final.get("candidate")
             if registrar and candidato is not None and REGISTRO_AV5.mlflow is not None and not candidato.get("requiere_spark"):
                 inicio_ej = pd.Timestamp(FUENTE_AV5.fecha_maxima_objetivo) + pd.Timedelta(days=1)
-                ejemplo = pd.DataFrame({**{c: np.zeros(2, dtype=np.float32) for c in FUENTE_AV5.num_features},
-                                        **{c: np.zeros(2, dtype=np.int32) for c in FUENTE_AV5.cat_features},
+                # firma del modelo: numéricas double (cualquier float cabe sin pérdida), categóricas como TEXTO (el modelo las
+                # codifica con su vocabulario: así 22_pronostico_operativo le pasa la Oro tal cual) y fechas de origen/objetivo
+                ejemplo = pd.DataFrame({**{c: np.zeros(2, dtype=np.float64) for c in FUENTE_AV5.num_features},
+                                        **{c: [str(next(iter(FUENTE_AV5.codigos[c])) if FUENTE_AV5.codigos[c] else "0")] * 2
+                                           for c in FUENTE_AV5.cat_features},
                                         "ingenuo_estacional": np.zeros(2), "origen": [inicio_ej] * 2,
                                         "fecha_objetivo": [inicio_ej + pd.Timedelta(days=1)] * 2})
-                ejemplo["h"] = 1
+                ejemplo["h"] = np.array([1, 1], dtype=np.int64)
                 fila_p = TABLAS_SALIDA_AV5.get("comparativa_prueba", pd.DataFrame()).set_index("modelo") if "comparativa_prueba" in TABLAS_SALIDA_AV5 else None
                 metricas_uc = {"wmape_desarrollo": round(wm_dev, 4)}
                 if fila_p is not None and MODELO_FINAL in fila_p.index:
@@ -3908,7 +4056,7 @@ hallazgo(f"Comparativa de desarrollo: {n_hom} ensambles homogéneos y {n_het} he
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 5.3 Prueba en datos no vistos (septiembre)
+# MAGIC ### 5.3 Prueba en datos no vistos (septiembre y octubre)
 # MAGIC Todos los modelos se entrenaron con datos hasta el 31 de agosto y se congelaron; pronostican del 1 al 28 de
 # MAGIC septiembre sin reentrenar. La tabla conserva el **orden de desarrollo** (no se reordena con la prueba, para no elegir
 # MAGIC con ella). `diferencia` = WMAPE en prueba − WMAPE en desarrollo: un valor cercano a cero indica que el desempeño se
@@ -3934,13 +4082,13 @@ if HAY_PRUEBA:
     from scipy.stats import spearmanr
     candidatos = NV.loc[~NV.tipo.isin(["referencia", "diagnostico"])]
     rho = spearmanr(candidatos["wmape_desarrollo"], candidatos["wmape_prueba"]).correlation if len(candidatos) > 2 else np.nan
-    hallazgo(f"Datos no vistos (septiembre): {AGG_LABELS[MODELO_FINAL]} WMAPE {nv.loc[MODELO_FINAL, 'wmape_prueba']:.4f} "
+    hallazgo(f"Datos no vistos (septiembre–octubre): {AGG_LABELS[MODELO_FINAL]} WMAPE {nv.loc[MODELO_FINAL, 'wmape_prueba']:.4f} "
              f"({nv.loc[MODELO_FINAL, 'mejora_vs_ingenuo_prueba']:+.1%} contra el ingenuo, {nv.loc['B0_Ingenuo', 'wmape_prueba']:.4f}; "
              f"sesgo {nv.loc[MODELO_FINAL, 'sesgo_prueba_pct']:+.2f} %); en desarrollo tenía {nv.loc[MODELO_FINAL, 'wmape_desarrollo']:.4f} "
-             f"(diferencia {nv.loc[MODELO_FINAL, 'diferencia']:+.4f}). El orden de los modelos se sostiene en septiembre "
+             f"(diferencia {nv.loc[MODELO_FINAL, 'diferencia']:+.4f}). El orden de los modelos se sostiene en la prueba "
              f"(correlación de rangos desarrollo–prueba {rho:.2f}).")
 else:
-    print("Esta corrida no tiene bloques de prueba (la Oro no incluye septiembre).")
+    print("Esta corrida no tiene bloques de prueba (la Oro no incluye los meses de prueba).")
 
 # COMMAND ----------
 
@@ -4059,7 +4207,7 @@ hallazgo(f"La corrida tardó {float(RESUMEN_C['minutos_modelado']):.0f} min de m
 # MAGIC Pesos fijados antes de ver resultados: error 35 %, estabilidad 10 %, sesgo 10 %, error en mercancía 10 %, costo de
 # MAGIC reentrenamiento 15 % (no penaliza mientras quepa en el Job mensual), interpretabilidad 10 % y operabilidad 10 %. El
 # MAGIC error se puntúa como mejora sobre el ingenuo relativa a la mejor mejora. La elección quedó registrada en la bitácora
-# MAGIC **antes** de evaluar septiembre.
+# MAGIC **antes** de evaluar los bloques de prueba.
 
 # COMMAND ----------
 
@@ -4085,7 +4233,7 @@ hallazgo(ARGUMENTO_FINAL)
 
 # MAGIC %md
 # MAGIC ## 6. Intervalos, diagnóstico estadístico y compuerta de aceptación
-# MAGIC ### 6.1 Intervalos P10–P90 en septiembre
+# MAGIC ### 6.1 Intervalos P10–P90 en la prueba no vista
 # MAGIC `cobertura` = fracción de días reales dentro de [P10, P90] (objetivo 80 %, banda 75–85 %). `ancho_relativo` = ancho
 # MAGIC medio del intervalo entre la venta media (más angosto = más útil, si cubre). Las pérdidas pinball relativas miden la
 # MAGIC calidad de cada cuantil (menor es mejor). `tasa_cruces_final` debe ser 0 (P10 ≤ P50 ≤ P90).
@@ -4116,7 +4264,7 @@ if "cuantiles" in C and len(C["cuantiles"]):
         mostrar(fuera[["ambito", "tipo_categoria", "region", "cobertura", "ancho_relativo"]].head(20),
                 f"Grupos fuera de la banda con {METODO_FINAL}", formatos={"cobertura": "pct", "ancho_relativo": "dec3"})
     g = GQ.set_index("metodo")
-    hallazgo(f"Intervalos en septiembre: " + "; ".join(f"{m} cubre {r.cobertura:.1%} con ancho relativo {r.ancho_relativo:.2f}"
+    hallazgo(f"Intervalos en la prueba no vista: " + "; ".join(f"{m} cubre {r.cobertura:.1%} con ancho relativo {r.ancho_relativo:.2f}"
                                                          for m, r in g.iterrows())
              + f". El modelo final usa {METODO_FINAL} ({'método automático: menor pinball dentro de la banda' if METODO_INTERVALOS == 'automatico' else 'fijado en la configuración'}).")
 else:
@@ -4208,7 +4356,7 @@ ax.barh(y_pos, orden["wmape_media_cortes"], xerr=orden["wmape_desviacion_cortes"
         linewidth=0.5, error_kw={"ecolor": "#4A4A4A", "capsize": 3}, label="desarrollo (media ± desviación entre cortes)")
 if HAY_PRUEBA:
     ax.scatter(orden["modelo"].map(C["comparativa_prueba"].set_index("modelo")["wmape_media_cortes"]), y_pos, marker="D", s=28,
-               color="#2E4D2E", zorder=3, label="prueba no vista (septiembre)")
+               color="#2E4D2E", zorder=3, label="prueba no vista (sep–oct)")
 ax.set_yticks(y_pos, [AGG_LABELS[m] for m in orden["modelo"]], fontsize=8)
 ax.invert_yaxis()
 ax.xaxis.set_major_formatter(PercentFormatter(1))
@@ -4227,7 +4375,7 @@ texto = (f"{AGG_LABELS[MODELO_FINAL]} (barra resaltada) logra WMAPE medio {f.loc
          f"desviación entre cortes (estabilidad), no un intervalo de confianza. ")
 if HAY_PRUEBA:
     cp = C["comparativa_prueba"].set_index("modelo")
-    texto += (f"Los rombos son septiembre, que no intervino en ninguna decisión: el modelo final obtiene {cp.loc[MODELO_FINAL, 'wmape_media_cortes']:.4f} "
+    texto += (f"Los rombos son los bloques de prueba (septiembre y octubre), que no intervinieron en ninguna decisión: el modelo final obtiene {cp.loc[MODELO_FINAL, 'wmape_media_cortes']:.4f} "
               f"(ingenuo {cp.loc['B0_Ingenuo', 'wmape_media_cortes']:.4f}), así que la ventaja se sostiene fuera de la muestra de desarrollo.")
 interpretar(1, "Comparación de modelos", texto)
 
@@ -4265,8 +4413,8 @@ texto = (f"El pronóstico agregado sigue el patrón semanal de la venta real: la
          f"(el mayor en {peor}). ")
 pruebas = [b for b in bloques if b.startswith("prueba")]
 if pruebas:
-    texto += (f"En septiembre (no visto) el sesgo es {', '.join(f'{sesgos[b]:+.1%} en {b}' for b in pruebas)}: incluye la quincena y las "
-              "fiestas patrias (15–16 de septiembre), que el calendario del modelo sí conoce. ")
+    texto += (f"En la prueba no vista el sesgo es {', '.join(f'{sesgos[b]:+.1%} en {b}' for b in pruebas)}: incluye la quincena y las "
+              "fiestas patrias (15–16 de septiembre) y Halloween, que el calendario del modelo sí conoce. ")
 texto += ("Los picos que el modelo suaviza corresponden a días con promociones o eventos que no se conocen en el origen; el calendario "
           "de promociones futuras (sección 9) es la vía para capturarlos. La línea del ingenuo copia la semana previa y por eso se "
           "adelanta o atrasa a los picos. Al sumar tiendas los errores se compensan: la cercanía de las curvas no implica error pequeño "
@@ -4312,7 +4460,7 @@ texto = (f"La mediana del residuo relativo es {np.median(rd):+.2f} veces la vent
          f"{dev_h.min():+.1f} % (h = {int(dev_h.idxmin())}) a {dev_h.max():+.1f} % (h = {int(dev_h.idxmax())}); "
          f"{int((dev_h.abs() > 3).sum())} de 14 horizontes salen de ±3 %. ")
 if "prueba" in rel:
-    texto += (f"En septiembre la distribución {'se mantiene' if abs(np.median(rel['prueba']) - np.median(rd)) < 0.1 else 'se desplaza'} "
+    texto += (f"En la prueba no vista la distribución {'se mantiene' if abs(np.median(rel['prueba']) - np.median(rd)) < 0.1 else 'se desplaza'} "
               f"(mediana {np.median(rel['prueba']):+.2f}), señal de que los errores no cambiaron de naturaleza con el mes nuevo.")
 interpretar(3, "Análisis de residuos", texto)
 
@@ -4347,7 +4495,7 @@ texto = (f"Cada punto agrupa las filas cuyo pronóstico cae en un tramo; si el m
          "sin venta) una razón menor que 1 indica que se pronostica algo de venta donde casi siempre hay cero; en los tramos altos, que "
          "pesan más en el WMAPE y en el surtido, la razón cercana a 1 indica buena calibración. ")
 if "prueba" in razones:
-    texto += f"En septiembre la razón va de {razones['prueba'].min():.2f} a {razones['prueba'].max():.2f}."
+    texto += f"En la prueba no vista la razón va de {razones['prueba'].min():.2f} a {razones['prueba'].max():.2f}."
 interpretar(4, "Calibración por tramo", texto)
 
 # ---------------------------------------------------------------------------------------------- 5. importancia de variables y pesos
@@ -4457,7 +4605,7 @@ if "cuantiles" in C and len(C["cuantiles"]):
     axes[0].yaxis.set_major_formatter(PercentFormatter(1))
     axes[0].set_xticks(range(1, 15))
     axes[0].set_xlabel("h")
-    axes[0].set_title("Cobertura P10–P90 por horizonte (septiembre)", fontsize=9)
+    axes[0].set_title("Cobertura P10–P90 por horizonte (prueba no vista)", fontsize=9)
     axes[0].legend(fontsize=7, frameon=False)
     d = Qh.loc[Qh.metodo.eq(METODO_FINAL) & Qh.ambito.isin(["tipo_categoria", "region"])].copy()
     d["grupo"] = np.where(d.ambito.eq("tipo_categoria"), "tipo: " + d["tipo_categoria"].astype(str), "región: " + d["region"].astype(str))
@@ -4482,6 +4630,7 @@ if "cuantiles" in C and len(C["cuantiles"]):
 if INTERPRETACIONES and EJECUTAR_ENTRENAMIENTO and RUN_ID_ACTUAL:
     try:
         limpio, esquema = _para_spark(pd.DataFrame(INTERPRETACIONES).assign(run_id=RUN_ID_ACTUAL, modelo=MODELO_FINAL, fecha=pd.Timestamp.now()))
+        borrar_corrida(tabla("mlops", "av5_interpretaciones"), RUN_ID_ACTUAL)
         (spark.createDataFrame(limpio, schema=esquema).write.format("delta").mode("append").option("mergeSchema", "true")
          .saveAsTable(tabla("mlops", "av5_interpretaciones")))
     except Exception as e:
@@ -4535,44 +4684,51 @@ if existe(TABLA_MONITOREO):
         alertas = MON[["alerta_error", "alerta_sesgo", "alerta_cobertura"]].sum()
         mostrar_publico(MON.sort_values(["semana", "region", "tipo_categoria"]).head(30), "Monitoreo por semana × región × tipo (prueba)",
                         formatos={"wmape": "dec4", "sesgo_pct": "dec2", "cobertura": "pct"})
-        hallazgo(f"Monitoreo de septiembre: {len(MON)} combinaciones semana × región × tipo; alertas de error {int(alertas['alerta_error'])}, "
+        hallazgo(f"Monitoreo de la prueba no vista: {len(MON)} combinaciones semana × región × tipo; alertas de error {int(alertas['alerta_error'])}, "
                  f"de sesgo {int(alertas['alerta_sesgo'])} y de cobertura {int(alertas['alerta_cobertura'])}.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 9. Calendario de promociones futuras (apartado preparado, apagado)
-# MAGIC **Situación actual (confirmada).** El modelo sólo ve promociones **pasadas**: `s_tasa_descuento_28`,
-# MAGIC `s_intensidad_promo_28` y `s_promos_en_venta_28` promedian los 28 días anteriores a T y `s_promos_vigentes_t0` cuenta
-# MAGIC las promociones con venta en la última semana (≤ T). Ninguna variable mira los 14 días que se pronostican. Por eso,
-# MAGIC cuando una promoción empieza dentro de esa ventana, el modelo no la anticipa y subestima el pico (se ve en el gráfico 2).
+# MAGIC ## 9. Calendario de promociones planeadas
+# MAGIC **Lo que el modelo veía antes.** Sólo promociones **pasadas**: `s_tasa_descuento_28`, `s_intensidad_promo_28` y
+# MAGIC `s_promos_en_venta_28` promedian los 28 días anteriores a T y `s_promos_vigentes_t0` cuenta las promociones con venta
+# MAGIC en la última semana (≤ T). Ninguna mira los 14 días que se pronostican, así que una promoción que empieza dentro de
+# MAGIC la ventana no se anticipaba.
 # MAGIC
-# MAGIC **Qué falta.** Un calendario de promociones **planeadas** de Bnext con el esquema de abajo, cargado en
-# MAGIC `silver.calendario_promociones`.
+# MAGIC **Lo que ve ahora.** Con `USAR_CALENDARIO_PROMOS = True` entran `f_promos_planeadas`, `f_descuento_planeado` y
+# MAGIC `f_dias_promo_restantes`, calculadas desde `silver.calendario_promociones_plan_dia`. Esa tabla la escribe
+# MAGIC `13_calendario_promociones_plan` a partir de dos fuentes: (1) el archivo editable
+# MAGIC `outputs/calendario/calendario_promociones_plan.xlsx` del volumen (promociones futuras: hoy un *placeholder*
+# MAGIC inventado que se sustituye por el plan de Bnext editando el Excel) y (2) la vigencia observada de las promociones
+# MAGIC pasadas (`silver.calendario_promociones` del 09) como aproximación del plan histórico, suponiendo que el plan se
+# MAGIC conocía `DIAS_ANTICIPACION_HISTORICO` días antes de empezar. Esa suposición queda declarada en la tabla (`fuente`).
 # MAGIC
-# MAGIC **Cómo se activa** (sin cambiar nada más):
-# MAGIC 1. Cargar el calendario en `silver.calendario_promociones` (una fila por promoción × alcance).
-# MAGIC 2. Correr la celda de abajo: valida el esquema, las fechas y la cobertura.
-# MAGIC 3. Cambiar `USAR_CALENDARIO_PROMOS = True` (sección 1.7) y correr la libreta: `FuenteAvance5` une las variables
-# MAGIC    `f_promos_planeadas`, `f_descuento_planeado` y `f_dias_promo_restantes` por tienda × categoría × día objetivo, y
-# MAGIC    todos los modelos las usan.
-# MAGIC 4. Comparar contra esta corrida: la ganancia debería concentrarse en los días con promoción (gráficos 2 y 3).
+# MAGIC **Sin fuga.** Cada promoción trae `fecha_publicacion`; en cada origen T sólo cuentan las publicadas en o antes de T.
+# MAGIC Por eso las variables `f_*` son legítimas en los cortes históricos y en la prueba no vista (septiembre–octubre).
 # MAGIC
-# MAGIC **Para entrenar con historia**, el calendario debe cubrir también los meses pasados: si Bnext no tiene los planes
-# MAGIC históricos, se puede usar la vigencia observada de cada promoción (`silver.promociones`) como aproximación del plan, con
-# MAGIC la advertencia de que supone que el plan se cumplió tal cual.
+# MAGIC **Para actualizar el plan**: editar el Excel, volver a subirlo al volumen y correr `13`; el pronóstico operativo
+# MAGIC (`22_pronostico_operativo`) y el what-if (`30`) toman el plan nuevo sin reentrenar.
 
 # COMMAND ----------
 
-titulo("9. CALENDARIO DE PROMOCIONES FUTURAS")
+titulo("9. CALENDARIO DE PROMOCIONES PLANEADAS")
 mostrar(pd.DataFrame([{"columna": k, "tipo y significado": v} for k, v in ESQUEMA_CALENDARIO_PROMOS.items()]),
-        "Esquema esperado del calendario de promociones")
-if existe(TABLA_CALENDARIO_PROMOS):
-    revision = validar_calendario_promociones(spark.table(TABLA_CALENDARIO_PROMOS))
-    mostrar(pd.DataFrame([revision]), "Revisión del calendario cargado")
-    print("USAR_CALENDARIO_PROMOS =", USAR_CALENDARIO_PROMOS, "→", "en uso" if FUENTE_AV5._promos_futuras is not None else "todavía no se usa")
+        "Contrato del archivo editable (hoja promociones)")
+print(f"USAR_CALENDARIO_PROMOS = {USAR_CALENDARIO_PROMOS} → ", end="")
+print("variables f_* EN USO por los modelos." if FUENTE_AV5._promos_futuras is not None else "variables f_* NO usadas en esta corrida.")
+mostrar(pd.DataFrame([FUENTE_AV5.info_calendario]), "Estado del calendario (tabla tienda × categoría × día)")
+if existe(TABLA_CALENDARIO_PLAN):
+    plan = spark.table(TABLA_CALENDARIO_PLAN)
+    revision = validar_calendario_promociones(plan)
+    mostrar(pd.DataFrame([revision]), "Revisión del plan (promoción × alcance)")
+    por_fuente = plan.groupBy("fuente").agg(F.countDistinct("promo_id").alias("promociones"), F.min("inicio_planeado").alias("desde"),
+                                           F.max("fin_planeado").alias("hasta")).orderBy("fuente").toPandas()
+    mostrar(por_fuente, "Promociones por fuente (placeholder = inventadas, sustituir por el plan de Bnext)")
+    if (por_fuente["fuente"] == "placeholder").any():
+        aviso("El calendario contiene promociones placeholder (inventadas): sustituirlas por el plan real de Bnext en el Excel del volumen.")
 else:
-    print(f"Todavía no existe {TABLA_CALENDARIO_PROMOS}: el modelo sigue usando sólo promociones pasadas (USAR_CALENDARIO_PROMOS = {USAR_CALENDARIO_PROMOS}).")
+    print(f"Todavía no existe {TABLA_CALENDARIO_PLAN}: corre 13_calendario_promociones_plan para crearla desde el Excel del volumen.")
 
 # COMMAND ----------
 
@@ -4590,7 +4746,7 @@ print("\nComparativa de desarrollo (ordenada por WMAPE medio de los cortes):")
 print(COMP[["posicion", "etiqueta", "tipo", "wmape_media_cortes", "wmape_desviacion_cortes", "mejora_vs_ingenuo", "sesgo_medio_pct",
             "wmape_mercancia", "min_entrenamiento_por_corte"]].to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 if HAY_PRUEBA:
-    print("\nPrueba no vista (septiembre):")
+    print("\nPrueba no vista (septiembre–octubre):")
     print(NV.drop(columns=["modelo"]).to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 if "ajuste_resumen" in C:
     print("\nAjuste fino:")
@@ -4599,7 +4755,7 @@ print("\nMatriz de decisión:")
 print(DEC.drop(columns=[c for c in ("modelo_final", "argumento") if c in DEC]).to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 print(f"\n{ARGUMENTO_FINAL}")
 if "cuantiles" in C:
-    print("\nIntervalos (septiembre):")
+    print("\nIntervalos (prueba no vista):")
     print(GQ.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 if COMPUERTA_C:
     print(f"\nCompuerta: {COMPUERTA_C['desarrollo_status']} · registro: {COMPUERTA_C['registry_action']} · motivos de bloqueo: "
