@@ -82,23 +82,23 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install lightgbm
+# MAGIC %pip install "lightgbm>=4.3,<5"
 
 # COMMAND ----------
 
-# MAGIC %pip install xgboost
+# MAGIC %pip install "xgboost>=2.0,<4"
 
 # COMMAND ----------
 
-# MAGIC %pip install catboost
+# MAGIC %pip install "catboost>=1.2,<2"
 
 # COMMAND ----------
 
-# MAGIC %pip install optuna
+# MAGIC %pip install "optuna>=3.6,<5"
 
 # COMMAND ----------
 
-# MAGIC %pip install shap
+# MAGIC %pip install "shap>=0.44,<1"
 
 # COMMAND ----------
 
